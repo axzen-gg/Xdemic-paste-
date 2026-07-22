@@ -25,7 +25,7 @@ const db = admin.database();
 // Track password attempt lockouts (IP + Paste ID)
 const attemptTracker = new Map();
 
-// 🖼️ LOGO URL: Replace the URL inside the quotes with your direct logo image link anytime!
+// 🖼️ LOGO URL: Replace with your direct image link
 const LOGO_URL = "https://via.placeholder.com/150x50.png?text=Xdemic+Logo";
 
 app.use(express.urlencoded({ extended: true }));
@@ -169,14 +169,30 @@ app.get('/', async (req, res) => {
     Object.keys(pastes).forEach(id => {
       const data = pastes[id];
       const author = data.author ? `by ${data.author}` : 'Anonymous';
-      listHtml += `
-        <div class="paste-card">
-          <h3>${data.title || 'Untitled Script'} ${data.password ? '🔒' : ''}</h3>
-          <div class="paste-meta">Created ${author}</div>
-          <p><a href="/v/${id}">View Script Page</a> | <a href="/raw/${id}" target="_blank">Raw URL</a></p>
-          <div class="code-box">loadstring(game:HttpGet("${req.protocol}://${req.get('host')}/raw/${id}"))()</div>
-        </div>
-      `;
+      const isLocked = !!data.password;
+      const isAuthed = req.session[`auth_${id}`] === true;
+
+      if (isLocked && !isAuthed) {
+        // Password protected and NOT unlocked: HIDE CODE AND RAW URL!
+        listHtml += `
+          <div class="paste-card">
+            <h3>${data.title || 'Untitled Script'} 🔒</h3>
+            <div class="paste-meta">Created ${author} • <span style="color: var(--danger-color); font-weight:600;">Password Protected</span></div>
+            <a href="/v/${id}" class="btn btn-secondary" style="display:inline-block; width:auto; padding: 8px 16px; font-size: 13px;">🔒 Unlock to Access Script</a>
+          </div>
+        `;
+      } else {
+        // Unlocked or no password
+        const rawUrl = `${req.protocol}://${req.get('host')}/raw/${id}${isLocked ? '?pass=' + encodeURIComponent(data.password) : ''}`;
+        listHtml += `
+          <div class="paste-card">
+            <h3>${data.title || 'Untitled Script'} ${isLocked ? '🔓 (Unlocked)' : ''}</h3>
+            <div class="paste-meta">Created ${author}</div>
+            <p><a href="/v/${id}">View Script Page</a> | <a href="${rawUrl}" target="_blank">Raw URL</a></p>
+            <div class="code-box">loadstring(game:HttpGet("${rawUrl}"))()</div>
+          </div>
+        `;
+      }
     });
   } catch (err) {
     console.error('Error fetching pastes:', err);
@@ -194,8 +210,8 @@ app.get('/', async (req, res) => {
         <textarea name="content" placeholder="Paste your Lua script here..." required></textarea>
       </div>
       <div class="form-group">
-        <label>Access Password (Optional - Protects viewer page)</label>
-        <input type="password" name="password" placeholder="Set password to lock viewer page">
+        <label>Access Password (Optional - Protects viewer page & raw URL)</label>
+        <input type="password" name="password" placeholder="Set password to lock page & script">
       </div>
       <button type="submit" class="btn">Save & Generate Loadstring</button>
     </form>
@@ -240,7 +256,7 @@ app.get('/v/:id', async (req, res) => {
     const lockBody = `
       <div class="alert">⛔ LOCKED OUT FOR 5 MINUTES</div>
       <h3>Too many wrong password attempts!</h3>
-      <p style="margin: 12px 0; color: var(--text-muted);">You entered the wrong password 3 times. Access to this URL is blocked for 5 minutes.</p>
+      <p style="margin: 12px 0; color: var(--text-muted);">You entered the wrong password 3 times. Access to this script is blocked for 5 minutes.</p>
       <p><strong>Time remaining:</strong> ~${minutesLeft} minute(s)</p>
       <a href="/" class="btn btn-secondary" style="margin-top: 16px;">Back to Home</a>
     `;
@@ -263,7 +279,7 @@ app.get('/v/:id', async (req, res) => {
     return res.send(layout('Locked Paste', body, res.locals.user));
   }
 
-  const rawUrl = `${req.protocol}://${req.get('host')}/raw/${pasteId}`;
+  const rawUrl = `${req.protocol}://${req.get('host')}/raw/${pasteId}${paste.password ? '?pass=' + encodeURIComponent(paste.password) : ''}`;
   const loadstringStr = `loadstring(game:HttpGet("${rawUrl}"))()`;
   const cleanContent = (paste.content || '').replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
@@ -272,7 +288,7 @@ app.get('/v/:id', async (req, res) => {
     <p style="font-size: 12px; color: var(--text-muted);">Uploaded by ${paste.author || 'Anonymous'}</p>
     <div style="margin: 16px 0;">
       <label>Raw Code URL:</label>
-      <p><a href="/raw/${pasteId}" target="_blank">${rawUrl}</a></p>
+      <p><a href="${rawUrl}" target="_blank">${rawUrl}</a></p>
     </div>
     <div style="margin: 16px 0;">
       <label>Roblox Auto Loadstring:</label>
@@ -320,10 +336,33 @@ app.post('/unlock/:id', async (req, res) => {
 
 // RAW ENDPOINT (FOR ROBLOX GAME:HTTPGET)
 app.get('/raw/:id', async (req, res) => {
-  const snapshot = await db.ref(`pastes/${req.params.id}`).once('value');
+  const pasteId = req.params.id;
+  const snapshot = await db.ref(`pastes/${pasteId}`).once('value');
   if (!snapshot.exists()) return res.status(404).send('Paste not found');
+
+  const paste = snapshot.val();
+  const attemptKey = `${req.ip}_${pasteId}`;
+  const attempt = attemptTracker.get(attemptKey) || { count: 0, lockUntil: 0 };
+
+  // Check 5-minute lockout timer
+  if (attempt.lockUntil > Date.now()) {
+    res.setHeader('Content-Type', 'text/plain');
+    return res.status(429).send('-- Error: Locked out due to 3 failed password attempts. Try again in 5 minutes.');
+  }
+
+  // Check password if set
+  if (paste.password) {
+    const isAuthed = req.session[`auth_${pasteId}`] === true;
+    const passQuery = req.query.pass;
+
+    if (!isAuthed && passQuery !== paste.password) {
+      res.setHeader('Content-Type', 'text/plain');
+      return res.status(403).send('-- Error: This script is password protected. Unlock it on the website or append ?pass=YOUR_PASSWORD');
+    }
+  }
+
   res.setHeader('Content-Type', 'text/plain');
-  res.send(snapshot.val().content);
+  res.send(paste.content);
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
